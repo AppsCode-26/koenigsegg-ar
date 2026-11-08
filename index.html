@@ -1,0 +1,468 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Koenigsegg AR</title>
+<link rel="icon" href="data:,">  <!-- no favicon request -->
+
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #111; font-family: -apple-system, system-ui, "Segoe UI", Roboto, sans-serif; color: #fff; }
+  #ar { position: fixed; inset: 0; }
+  #start { position: fixed; inset: 0; z-index: 10; display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 18px; text-align: center; padding: 24px; background: radial-gradient(circle at 50% 40%, #3a3f8f 0%, #1a1c40 70%, #0b0c1c 100%); }
+  #start h1 { margin: 0; font-size: 32px; letter-spacing: 1px; }
+  #start p { margin: 0; max-width: 320px; line-height: 1.45; opacity: .9; }
+  button { font: inherit; font-weight: 700; font-size: 18px; border: 0; border-radius: 999px; padding: 14px 30px; background: #ffd34d; color: #222; box-shadow: 0 6px 20px rgba(0,0,0,.35); touch-action: manipulation; }
+  button.secondary { background: transparent; color: #fff; border: 2px solid #ffffff55; font-size: 15px; padding: 10px 22px; box-shadow: none; }
+  #lights { position: fixed; top: 14px; right: 14px; z-index: 6; display: none; font-size: 15px; padding: 10px 18px; }
+  #lights.off { background: #222c; color: #fff; border: 2px solid #ffffff66; padding: 8px 16px; }
+  #hint { position: fixed; left: 50%; bottom: 46px; transform: translateX(-50%); z-index: 5; background: #000a; padding: 10px 16px; border-radius: 999px; font-size: 14px; display: none; white-space: nowrap; }
+  #credit { position: fixed; left: 0; right: 0; bottom: 8px; z-index: 5; text-align: center; font-size: 10px; opacity: .7; }
+  #credit a { color: inherit; }
+  #status { font-size: 14px; max-width: 330px; line-height: 1.4; min-height: 1em; }
+</style>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/",
+    "mindar-image-three": "https://cdn.jsdelivr.net/npm/mind-ar@1.2.5/dist/mindar-image-three.prod.js"
+  }
+}
+</script>
+</head>
+<body>
+<div id="start">
+  <h1>KOENIGSEGG</h1>
+  <div style="font-size:11px;opacity:.6">v1</div>         <!-- bump when you redeploy, so you can tell the phone has the new version -->
+  <p>Tap Start AR, allow the camera, then point your phone at the QR code. The car drives laps around it. Pinch to resize, move around to explore.</p>
+  <button id="go">Start AR</button>
+  <button id="preview" class="secondary">No QR? View in 3D</button>
+  <div id="status"></div>
+</div>
+<div id="ar"></div>
+<button id="lights" aria-pressed="true">💡 Lights ON</button>
+<div id="hint">Point at the QR code 📷 · pinch to resize</div>
+<div id="credit">Model: “<a href="https://sketchfab.com/3d-models/koenigsegg-one-pro-26d50f742f3241f5a36081d93205c764" target="_blank">Koenigsegg One Pro</a>” by <a href="https://sketchfab.com/Alister.Dsa" target="_blank">Head to Turbosquid - Allay Design</a>, <a href="http://creativecommons.org/licenses/by/4.0/" target="_blank">CC BY 4.0</a></div>
+
+<script type="module">
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { MeshoptDecoder } from 'three/addons/libs/meshopt_decoder.module.js';
+import { DRACOLoader } from 'three/addons/loaders/DRACOLoader.js';
+import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+
+// ======================= EDIT THESE =======================
+const CONFIG = {
+  version: 1,                 // bump on every deploy (cache-busting for model + target files)
+  model: './model.glb',       // car with separate wheel nodes (Wheel_XX / Spin_XX) and light materials
+  target: './targets.mind',   // compiled MindAR target(s); index 0 = the QR code
+  targetIndex: 0,
+  modelUpIsZ: false,          // set true if the model was exported Z-up (lies on its side in the 3D preview)
+  extraRotationY: 0,          // turn the model so its nose points along +Z (this car already does)
+  // --- driving (all lengths in QR-widths; QR width = 1 unit) ---
+  carLength: 0.7,             // nose-to-tail length of the car
+  trackRadiusX: 1.0,          // the car laps an oval around the QR code: half-width (left-right)
+  trackRadiusY: 1.25,         // half-height (towards the top/bottom of the QR)
+  clockwise: false,           // lap direction seen from above (false = counter-clockwise, turning left)
+  speed: 0.8,                 // cruising speed, QR-widths per second (~11 mph at scale)
+  maxWheelDegPerFrame: 25,    // slows the car on slow phones so the 5-spoke wheels never look like they spin backwards
+  lightsOnAtStart: true,
+};
+// ==========================================================
+
+const statusEl = document.getElementById('status');
+const hint = document.getElementById('hint');
+const lightsBtn = document.getElementById('lights');
+const WHEELS = ['FL', 'FR', 'RL', 'RR'];   // car nose = +Z, car's left = +X, up = +Y
+
+// Loads the model, centers it, and sits its lowest point at y = 0 ("on the paper").
+// Returns a holder group whose size is 1 unit long at scale = holder.userData.unit.
+async function loadModel() {
+  const loader = new GLTFLoader();
+  loader.setMeshoptDecoder(MeshoptDecoder);
+  const draco = new DRACOLoader();
+  draco.setDecoderPath('https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/libs/draco/gltf/');
+  loader.setDRACOLoader(draco);
+  const gltf = await loader.loadAsync(CONFIG.model + '?v=' + CONFIG.version);
+  const model = gltf.scene;
+  if (CONFIG.modelUpIsZ) model.rotation.x = -Math.PI / 2;
+  model.rotation.y += CONFIG.extraRotationY;
+  model.updateMatrixWorld(true);
+
+  const box = new THREE.Box3().setFromObject(model);
+  const size = box.getSize(new THREE.Vector3());
+  const center = box.getCenter(new THREE.Vector3());
+  const inner = new THREE.Group();
+  inner.add(model);
+  model.position.sub(new THREE.Vector3(center.x, box.min.y, center.z)); // centered, bottom at y=0
+
+  const holder = new THREE.Group();
+  holder.add(inner);
+  const footprint = Math.max(size.x, size.z);
+  holder.userData.unit = 1 / footprint;
+  holder.userData.size = size;
+  holder.scale.setScalar(1 / footprint);
+  return holder;
+}
+
+function addLights(scene, renderer) {
+  const pmrem = new THREE.PMREMGenerator(renderer);
+  scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
+  scene.add(new THREE.HemisphereLight(0xffffff, 0x444444, 1.2));
+  const sun = new THREE.DirectionalLight(0xffffff, 2.0);
+  sun.position.set(1, 2, 1.5);
+  scene.add(sun);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Driving: the car laps an oval around the QR code. Kinematics are exact rolling without slipping:
+//  * the rear-axle centre follows the oval and the car points along it (rear wheels never slide sideways)
+//  * front wheels steer to the Ackermann angle, atan(k*L / (1 - k*x)), so their axles point at the turn centre
+//  * every wheel spins at (its own ground speed) / (its own radius); inner/outer and front/rear wheels differ
+// ---------------------------------------------------------------------------------------------
+const smoothstep = (a, b, x) => { const t = Math.min(1, Math.max(0, (x - a) / (b - a))); return t * t * (3 - 2 * t); };
+
+function makeTrack(A, B, clockwise) {
+  // paper coordinates: x to the right, y towards the top of the QR. Track coordinates (Y up): X = x, Z = -y.
+  const d = clockwise ? -1 : 1, N = 4096;
+  const geo = t => {
+    const X = A * Math.cos(t), Z = -d * B * Math.sin(t);
+    const dX = -A * Math.sin(t), dZ = -d * B * Math.cos(t);       // first derivative
+    const ddX = -A * Math.cos(t), ddZ = d * B * Math.sin(t);      // second derivative
+    const sp = Math.hypot(dX, dZ);
+    // heading: the car's +Z axis points along (sin h, cos h); curvature k > 0 = turning left
+    return { X, Z, heading: Math.atan2(dX, dZ), kappa: (dZ * ddX - dX * ddZ) / (sp * sp * sp) };
+  };
+  const s = new Float64Array(N + 1);  // arc length table, so the speed is the real speed along the oval
+  let px = A, pz = 0;
+  for (let i = 1; i <= N; i++) { const p = geo(i / N * Math.PI * 2); s[i] = s[i - 1] + Math.hypot(p.X - px, p.Z - pz); px = p.X; pz = p.Z; }
+  const total = s[N];
+  return {
+    total,
+    at(dist) {
+      dist = ((dist % total) + total) % total;
+      let lo = 0, hi = N;
+      while (hi - lo > 1) { const mid = (lo + hi) >> 1; if (s[mid] <= dist) lo = mid; else hi = mid; }
+      const f = (dist - s[lo]) / (s[hi] - s[lo] || 1);
+      return geo((lo + f) / N * Math.PI * 2);
+    },
+  };
+}
+
+// soft round spot, colour premultiplied on upload (rgb = alpha = mask)
+function glowTexture() {
+  const c = document.createElement('canvas'); c.width = c.height = 128;
+  const g = c.getContext('2d'), gr = g.createRadialGradient(64, 64, 0, 64, 64, 64);
+  gr.addColorStop(0, 'rgba(255,255,255,1)'); gr.addColorStop(0.15, 'rgba(255,255,255,0.85)');
+  gr.addColorStop(0.4, 'rgba(255,255,255,0.3)'); gr.addColorStop(1, 'rgba(255,255,255,0)');
+  g.fillStyle = gr; g.fillRect(0, 0, 128, 128);
+  const t = new THREE.CanvasTexture(c); t.premultiplyAlpha = true; return t;
+}
+// procedural mask texture from f(u, v) -> 0..1  (u, v in 0..1; v = 0 is the top row of the canvas)
+function maskTexture(w, h, f) {
+  const c = document.createElement('canvas'); c.width = w; c.height = h;
+  const g = c.getContext('2d'), img = g.createImageData(w, h);
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    const i = (y * w + x) * 4; img.data[i] = img.data[i + 1] = img.data[i + 2] = 255;
+    img.data[i + 3] = Math.round(255 * Math.min(1, Math.max(0, f((x + 0.5) / w, (y + 0.5) / h))));
+  }
+  g.putImageData(img, 0, 0);
+  const t = new THREE.CanvasTexture(c); t.premultiplyAlpha = true; return t;
+}
+// "light" blending: adds colour and only partly covers what's behind (works over the camera video too)
+const lightBlend = { transparent: true, depthWrite: false, blending: THREE.CustomBlending, blendEquation: THREE.AddEquation,
+  blendSrc: THREE.OneFactor, blendDst: THREE.OneMinusSrcAlphaFactor, blendSrcAlpha: THREE.OneFactor, blendDstAlpha: THREE.OneMinusSrcAlphaFactor };
+
+function makeDrive(holder) {
+  holder.removeFromParent();
+  holder.position.set(0, 0, 0); holder.rotation.set(0, 0, 0);
+  holder.updateMatrixWorld(true);              // holder alone: world units = "car units" (car length = 1)
+  const inner = holder.children[0], model = inner.children[0];
+  [...inner.children, ...model.children].filter(o => o.userData.fx).forEach(o => o.removeFromParent());
+
+  // ---- wheels: positions and radii measured from the model itself
+  const wheels = WHEELS.map(id => {
+    const pivot = holder.getObjectByName('Wheel_' + id), spin = holder.getObjectByName('Spin_' + id);
+    if (!pivot || !spin) throw new Error('model is missing wheel ' + id);
+    pivot.rotation.set(0, 0, 0); spin.rotation.set(0, 0, 0); holder.updateMatrixWorld(true);  // measure un-rotated
+    const box = new THREE.Box3().setFromObject(spin);
+    return { id, pivot, spin, front: id[0] === 'F', p: pivot.getWorldPosition(new THREE.Vector3()), R: (box.max.y - box.min.y) / 2, angle: 0 };
+  });
+  const W = Object.fromEntries(wheels.map(w => [w.id, w]));
+  const rear = W.RL.p.clone().add(W.RR.p).multiplyScalar(0.5);   // rear-axle centre (car units)
+  const k = CONFIG.carLength;                                      // car units -> QR-widths
+  for (const w of wheels) { w.x = (w.p.x - rear.x) * k; w.z = (w.p.z - rear.z) * k; w.R *= k; }
+
+  // ---- rig:  world (QR space, paper = XZ) > pose (rear-axle centre on the track) > rig (car size) > holder
+  const world = new THREE.Group(), pose = new THREE.Group(), rig = new THREE.Group();
+  rig.scale.setScalar(k);
+  holder.position.set(-rear.x, 0, -rear.z);
+  rig.add(holder); pose.add(rig); world.add(pose);
+
+  // ---- lights: own materials so they can be switched; glow sprites + light on the ground
+  const mats = {};
+  holder.traverse(o => { if (o.isMesh) for (const m of [].concat(o.material)) if (/^(Headlight|Taillight)Mat$/.test(m.name)) mats[m.name] = m; });
+  const lampMats = [mats.HeadlightMat, mats.TaillightMat].filter(Boolean);
+  for (const m of lampMats) { m.userData.on = m.userData.on ?? m.emissiveIntensity; }
+
+  // lamp clusters (model coords, metres) from the GLB extras; fallback: bounding boxes of the light meshes
+  const carNode = holder.getObjectByName('Car');
+  let lamps = carNode && carNode.userData.lights;
+  if (!lamps) {
+    lamps = {};
+    for (const [mesh, key] of [['Headlights', 'head'], ['Taillights', 'tail']]) {
+      const o = holder.getObjectByName(mesh); if (!o) continue;
+      const b = new THREE.Box3().setFromObject(o), c = b.getCenter(new THREE.Vector3());
+      model.worldToLocal(c);
+      const ext = (b.max.x - b.min.x) / holder.userData.unit / 4;
+      for (const s of [1, -1]) lamps[key + (s > 0 ? 'L' : 'R')] = { center: [s * Math.abs(c.x) + s * ext, c.y, c.z], axes: [[1, 0, 0]], extent: [ext] };
+    }
+  }
+  const glowTex = glowTexture();
+  const glows = [];
+  for (const [name, L] of Object.entries(lamps)) {
+    const head = name.startsWith('head'), side = L.center[0] > 0 ? 1 : -1;
+    const c = new THREE.Vector3(...L.center), axis = new THREE.Vector3(...L.axes[0]).normalize();
+    const dir = new THREE.Vector3(side * (head ? 0.4 : 0.35), 0.3, head ? 1 : -1).normalize();  // way the lamp faces
+    // linear colours; keep red's green/blue at exactly 0 (sRGB output turns tiny values into visible orange)
+    const color = head ? new THREE.Color(0.92, 0.96, 1.0) : new THREE.Color(1.0, 0.0, 0.0);
+    const spots = [[-0.32, 0.34, 0.85], [0, 0.34, 0.85], [0.32, 0.34, 0.85], [0, 0.8, 0.3]];    // [along axis, size, alpha]
+    for (const [t, sz, a] of spots) {
+      const mat = new THREE.SpriteMaterial({ map: glowTex, ...lightBlend });
+      const sp = new THREE.Sprite(mat);
+      const size = (head ? 0.04 : 0.03) * sz;
+      sp.scale.set(size, size, 1); sp.renderOrder = 10; sp.userData.fx = true;
+      model.add(sp);
+      glows.push({ sp, base: c.clone().addScaledVector(axis, t * L.extent[0]), dir, color, alpha: a, lift: size * 0.45 });
+    }
+  }
+  // headlight beam on the ground ahead of the car, red glow behind (in "inner" = centred car, metres, ground y = 0)
+  const size = holder.userData.size;
+  const beamTex = maskTexture(64, 128, (u, v) => {   // v = 0 at the car end, 1 far ahead; soft fan, no hard edges
+    const half = 0.32 + 0.68 * v, x = (u * 2 - 1) / half;
+    return Math.exp(-4 * x * x) * smoothstep(0, 0.22, v) * Math.pow(1 - v, 2);
+  });
+  const tailTex = maskTexture(64, 32, (u, v) => { const x = u * 2 - 1; return Math.exp(-4 * x * x) * smoothstep(0, 0.3, v) * Math.pow(1 - v, 2); });
+  const pools = [];
+  const addPool = (tex, w, len, z0, forward, color, alpha) => {
+    const m = new THREE.Mesh(new THREE.PlaneGeometry(w, len), new THREE.MeshBasicMaterial({ map: tex, color, opacity: alpha, ...lightBlend }));
+    m.rotation.x = -Math.PI / 2;                  // plane's top edge (texture v = 0, the car end) -> -Z
+    if (!forward) m.rotation.z = Math.PI;         // flip for the rear
+    m.position.set(0, size.y * 0.012, z0 + (forward ? 1 : -1) * len / 2);
+    m.renderOrder = 5; m.userData.fx = true; inner.add(m); pools.push(m);
+  };
+  // headlight beam lands on the paper ahead of the bumper; faint red glow behind
+  addPool(beamTex, size.x * 1.6, size.z * 1.1, size.z / 2 + size.z * 0.02, true, new THREE.Color(1.0, 0.93, 0.8).multiplyScalar(0.32), 0.06);
+  addPool(tailTex, size.x * 0.9, size.z * 0.25, -size.z / 2 - size.z * 0.01, false, new THREE.Color(1.0, 0.0, 0.0).multiplyScalar(0.6), 0.22);
+  // soft contact shadow under the car
+  const shadowTex = maskTexture(64, 128, (u, v) => {
+    const dx = Math.max(0, Math.abs(u * 2 - 1) - 0.55) / 0.45, dz = Math.max(0, Math.abs(v * 2 - 1) - 0.72) / 0.28;
+    return Math.pow(Math.max(0, 1 - Math.hypot(dx, dz)), 1.5);
+  });
+  const shadow = new THREE.Mesh(new THREE.PlaneGeometry(size.x * 1.25, size.z * 1.12),
+    new THREE.MeshBasicMaterial({ map: shadowTex, color: 0x000000, transparent: true, opacity: 0.55, depthWrite: false, premultipliedAlpha: true }));
+  shadow.rotation.x = -Math.PI / 2; shadow.position.y = size.y * 0.008; shadow.renderOrder = -1; shadow.userData.fx = true; inner.add(shadow);
+
+  let lightsOn = true;
+  function setLights(on) {
+    lightsOn = on;
+    for (const m of lampMats) { m.emissiveIntensity = on ? m.userData.on : 0; m.color.setScalar(on ? 1 : 0.35); }
+    for (const g of glows) g.sp.visible = on;
+    for (const p of pools) p.visible = on;
+  }
+
+  // ---- track + speed limit that keeps every wheel under maxWheelDegPerFrame
+  const track = makeTrack(CONFIG.trackRadiusX, CONFIG.trackRadiusY, CONFIG.clockwise);
+  let spinPerUnit = 0;   // largest wheel rotation (radians) per QR-width travelled, anywhere on the lap
+  for (let i = 0; i < 720; i++) {
+    const P = track.at(track.total * i / 720);
+    for (const w of wheels) spinPerUnit = Math.max(spinPerUnit, Math.hypot(1 - P.kappa * w.x, P.kappa * w.z) / w.R);
+  }
+  let dist = 0, v = 0, fps = 60;
+  const camLocal = new THREE.Vector3(), toCam = new THREE.Vector3();
+
+  function pose_(P) {
+    pose.position.set(P.X, 0, P.Z);
+    pose.rotation.set(0, P.heading, 0);
+    for (const w of wheels) if (w.front) w.pivot.rotation.y = Math.atan2(P.kappa * w.z, 1 - P.kappa * w.x);
+  }
+  pose_(track.at(0));
+
+  function update(dt, camera) {
+    dt = Math.min(Math.max(dt, 0), 0.1);
+    if (dt > 0) fps += (Math.min(1 / dt, 120) - fps) * 0.05;
+    const vMax = Math.min(CONFIG.speed, THREE.MathUtils.degToRad(CONFIG.maxWheelDegPerFrame) * fps / spinPerUnit);
+    v += THREE.MathUtils.clamp(vMax - v, -1.2 * dt, 0.5 * dt);      // gentle acceleration / braking
+    const ds = v * dt;
+    dist = (dist + ds) % track.total;
+    const P = track.at(dist);
+    pose_(P);
+    for (const w of wheels) {
+      // ground speed of this wheel's contact point / wheel radius (rigid car turning about the rear-axle line)
+      w.angle = (w.angle + ds * Math.hypot(1 - P.kappa * w.x, P.kappa * w.z) / w.R) % (Math.PI * 2);
+      w.spin.rotation.x = w.angle;   // +X rotation rolls the tyre forward (+Z)
+    }
+    if (lightsOn && camera) {        // glows: brightest when you look into the lamp, hidden from behind
+      world.updateMatrixWorld(true);
+      camera.updateMatrixWorld();
+      model.worldToLocal(camera.getWorldPosition(camLocal));
+      for (const g of glows) {
+        toCam.copy(camLocal).sub(g.base).normalize();
+        const f = smoothstep(-0.15, 0.45, toCam.dot(g.dir));
+        g.sp.position.copy(g.base).addScaledVector(toCam, g.lift);  // nudge towards the viewer so the body doesn't clip it
+        g.sp.material.color.copy(g.color).multiplyScalar(f);
+        g.sp.material.opacity = g.alpha * f;
+      }
+    }
+  }
+  return { world, update, setLights, get lightsOn() { return lightsOn; }, get speed() { return v; }, get fps() { return fps; },
+           debug: { wheels, track, spinPerUnit, pose, rig, holder, glows, pools, shadow, lampMats, get dist() { return dist; } } };
+}
+
+let drive = null;
+function showLightsButton() {
+  lightsBtn.style.display = 'block';
+  const paint = () => {
+    lightsBtn.textContent = drive.lightsOn ? '💡 Lights ON' : '💡 Lights OFF';
+    lightsBtn.classList.toggle('off', !drive.lightsOn);
+    lightsBtn.setAttribute('aria-pressed', drive.lightsOn);
+  };
+  drive.setLights(CONFIG.lightsOnAtStart); paint();
+  lightsBtn.onclick = () => { drive.setLights(!drive.lightsOn); paint(); };
+}
+
+// springy pop-up when the QR is found
+function popIn(obj) {
+  const t0 = performance.now();
+  function step(t) {
+    const k = Math.min(1, (t - t0) / 700);
+    const e = 1 - Math.pow(1 - k, 3) * Math.cos(k * 4);
+    obj.scale.setScalar(obj.userData.baseScale * obj.userData.getUserScale() * Math.max(0.001, e));
+    if (k < 1) requestAnimationFrame(step);
+  }
+  requestAnimationFrame(step);
+}
+
+// start downloading right away so Start AR is fast
+const mindarModule = import('mindar-image-three');
+const modelPromise = loadModel();
+modelPromise.catch(e => { statusEl.textContent = 'Model failed to load: ' + e.message; });
+
+function cameraHelp(e) {
+  const name = (e && e.name) || '';
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia)
+    return 'This browser can\'t use the camera here. Open this page in Safari (iPhone) or Chrome (Android).';
+  if (name === 'NotAllowedError' || name === 'SecurityError')
+    return 'Camera is blocked. iPhone: tap "aA" in the address bar → Website Settings → Camera → Allow, then reload. Also check Settings → Safari → Camera.';
+  if (name === 'NotReadableError') return 'The camera is busy in another app. Close it and try again.';
+  return 'Could not start the camera' + (name ? ' (' + name + ')' : '') + '. Reload and try again.';
+}
+
+document.getElementById('go').onclick = async () => {
+  // IMPORTANT (iPhone): ask for the camera immediately inside the tap, before any other awaits,
+  // otherwise Safari may refuse without showing the permission popup.
+  statusEl.textContent = 'Asking for the camera…';
+  try {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) throw new Error('nomedia');
+    const s = await navigator.mediaDevices.getUserMedia({ audio: false, video: { facingMode: 'environment' } });
+    s.getTracks().forEach(t => t.stop());
+  } catch (e) { console.error(e); statusEl.textContent = cameraHelp(e); return; }
+
+  statusEl.textContent = 'Loading…';
+  try {
+    const { MindARThree } = await mindarModule;
+    const mindar = new MindARThree({
+      container: document.getElementById('ar'),
+      imageTargetSrc: CONFIG.target + '?v=' + CONFIG.version,
+      maxTrack: 1, warmupTolerance: 2, missTolerance: 10,
+      uiScanning: 'no', uiLoading: 'yes',
+      filterMinCF: 0.0001, filterBeta: 0.01,   // smoothing (lower beta = smoother, more lag)
+    });
+    const { renderer, scene, camera } = mindar;
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
+    renderer.setPixelRatio(Math.min(devicePixelRatio, 2));   // full 3x on big phones costs a lot of GPU for no visible gain
+    addLights(scene, renderer);
+
+    // MindAR target space: the paper is the XY plane, +Z points out of the paper toward the viewer.
+    // three.js models are Y-up, so rotate +90° around X to make the car (and its track) stand on the paper.
+    drive = makeDrive(await modelPromise);
+    const obj = drive.world;
+    obj.rotation.x = Math.PI / 2;
+    obj.userData.baseScale = 1;              // track units are already QR-widths
+    const anchor = mindar.addAnchor(CONFIG.targetIndex);
+    anchor.group.add(obj);
+    anchor.onTargetFound = () => { hint.style.display = 'none'; popIn(obj); };
+    anchor.onTargetLost = () => { hint.style.display = 'block'; };
+
+    // two-finger pinch to resize
+    let pinchStart = 0, scaleStart = 1, userScale = 1;
+    obj.userData.getUserScale = () => userScale;
+    const dist = t => Math.hypot(t[0].clientX - t[1].clientX, t[0].clientY - t[1].clientY);
+    addEventListener('touchstart', e => { if (e.touches.length === 2) { pinchStart = dist(e.touches); scaleStart = userScale; } }, { passive: true });
+    addEventListener('touchmove', e => {
+      if (e.touches.length === 2 && pinchStart) {
+        userScale = Math.min(5, Math.max(0.2, scaleStart * dist(e.touches) / pinchStart));
+        obj.scale.setScalar(obj.userData.baseScale * userScale);
+      }
+    }, { passive: true });
+    addEventListener('touchend', e => { if (e.touches.length < 2) pinchStart = 0; });
+
+    await mindar.start();
+    document.getElementById('start').style.display = 'none';
+    hint.style.display = 'block';
+    showLightsButton();
+    const clock = new THREE.Clock();
+    renderer.setAnimationLoop(() => { drive.update(clock.getDelta(), camera); renderer.render(scene, camera); });
+  } catch (e) {
+    console.error(e);
+    statusEl.textContent = e ? 'Something went wrong: ' + (e.message || e) : cameraHelp(null);
+  }
+};
+
+// Fallback: watch the car drive around a QR code on a sheet of paper (also handy for checking on a computer)
+document.getElementById('preview').onclick = async () => {
+  statusEl.textContent = 'Loading…';
+  const { OrbitControls } = await import('three/addons/controls/OrbitControls.js');
+  const renderer = new THREE.WebGLRenderer({ antialias: true });
+  renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+  renderer.setSize(innerWidth, innerHeight);
+  renderer.outputColorSpace = THREE.SRGBColorSpace;
+  document.getElementById('ar').appendChild(renderer.domElement);
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(0xbfd6ea);
+  addLights(scene, renderer);
+  // a letter-size sheet with the QR code (QR printed 3 inches wide -> 1 unit)
+  const paper = new THREE.Mesh(new THREE.PlaneGeometry(8.5 / 3, 11 / 3),
+    new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.9, polygonOffset: true, polygonOffsetFactor: 2, polygonOffsetUnits: 2 }));
+  paper.rotation.x = -Math.PI / 2;
+  scene.add(paper);
+  new THREE.TextureLoader().load('./qr.png?v=' + CONFIG.version, tex => {
+    tex.colorSpace = THREE.SRGBColorSpace; tex.anisotropy = 4;
+    const qr = new THREE.Mesh(new THREE.PlaneGeometry(1, 1),
+      new THREE.MeshStandardMaterial({ map: tex, roughness: 0.9, polygonOffset: true, polygonOffsetFactor: 1, polygonOffsetUnits: 1 }));
+    qr.rotation.x = -Math.PI / 2;   // top of the QR image points to -Z, same as in AR
+    scene.add(qr);
+  });
+  const holder = await modelPromise;
+  drive = makeDrive(holder.parent ? holder.clone() : holder);
+  scene.add(drive.world);
+  const camera = new THREE.PerspectiveCamera(45, innerWidth / innerHeight, 0.01, 50);
+  camera.position.set(0.4, 2.6, 3.6);
+  const controls = new OrbitControls(camera, renderer.domElement);
+  controls.target.set(0, 0, 0);
+  controls.enableDamping = true;
+  controls.maxPolarAngle = Math.PI * 0.49;   // stay above the paper
+  addEventListener('resize', () => { camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix(); renderer.setSize(innerWidth, innerHeight); });
+  document.getElementById('start').style.display = 'none';
+  showLightsButton();
+  window.app.preview = { camera, controls, renderer, scene };
+  const clock = new THREE.Clock();
+  renderer.setAnimationLoop(() => { controls.update(); drive.update(clock.getDelta(), camera); renderer.render(scene, camera); });
+};
+
+window.app = { CONFIG, get drive() { return drive; } };   // for testing from the console
+</script>
+</body>
+</html>
